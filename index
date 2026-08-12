@@ -1,0 +1,135 @@
+// Parts Cam token server
+// Holds a Google refresh token permanently and exchanges it for fresh access
+// tokens on request. This avoids Safari's silent-auth blocking entirely,
+// since it never relies on browser cookies — just a direct server-to-Google
+// call using a refresh token that Google issues once and doesn't expire
+// (until you revoke access).
+
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+const {
+  GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET,
+  REDIRECT_URI,       // e.g. https://your-app.onrender.com/auth/callback
+  APP_SHARED_SECRET,  // a random string only your app knows, to protect /token
+  ALLOWED_ORIGIN       // e.g. https://daveecklund-lgtm.github.io
+} = process.env;
+
+const TOKEN_FILE = path.join(__dirname, 'refresh_token.json');
+
+function saveRefreshToken(token){
+  fs.writeFileSync(TOKEN_FILE, JSON.stringify({ refresh_token: token }));
+}
+function loadRefreshToken(){
+  try{
+    return JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8')).refresh_token;
+  }catch(e){
+    return null;
+  }
+}
+
+// CORS: only allow your GitHub Pages app to call this server
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', ALLOWED_ORIGIN || '*');
+  res.header('Access-Control-Allow-Headers', 'x-app-secret, Content-Type');
+  if(req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+// Step 1 (one-time, done by you in a browser): kicks off Google's consent screen
+app.get('/auth/start', (req, res) => {
+  const params = new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: REDIRECT_URI,
+    response_type: 'code',
+    scope: 'https://www.googleapis.com/auth/drive.file',
+    access_type: 'offline',   // required to get a refresh token
+    prompt: 'consent'         // required to force a refresh token every time
+  });
+  res.redirect('https://accounts.google.com/o/oauth2/v2/auth?' + params.toString());
+});
+
+// Step 2: Google redirects back here with a one-time code — exchange it for tokens
+app.get('/auth/callback', async (req, res) => {
+  const code = req.query.code;
+  if(!code) return res.status(400).send('Missing code');
+  try{
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        redirect_uri: REDIRECT_URI,
+        grant_type: 'authorization_code'
+      })
+    });
+    const data = await tokenRes.json();
+    if(!data.refresh_token){
+      return res.status(500).send(
+        'No refresh_token in response — this usually means you already granted access before. ' +
+        'Go to myaccount.google.com/permissions, remove access for this app, then try /auth/start again. ' +
+        'Raw response: ' + JSON.stringify(data)
+      );
+    }
+    saveRefreshToken(data.refresh_token);
+    res.send('Connected! Your Parts Cam app can now stay signed in permanently. You can close this tab.');
+  }catch(e){
+    res.status(500).send('Error exchanging code: ' + e.message);
+  }
+});
+
+// Step 3 (called automatically by the app, forever): get a fresh access token
+app.get('/token', async (req, res) => {
+  if(req.headers['x-app-secret'] !== APP_SHARED_SECRET){
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const refreshToken = loadRefreshToken();
+  if(!refreshToken){
+    return res.status(400).json({ error: 'not_connected', message: 'Visit /auth/start once to connect Drive first.' });
+  }
+  try{
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        refresh_token: refreshToken,
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        grant_type: 'refresh_token'
+      })
+    });
+    const data = await tokenRes.json();
+    if(!data.access_token){
+      return res.status(500).json({ error: 'refresh_failed', detail: data });
+    }
+    res.json({ access_token: data.access_token, expires_in: data.expires_in });
+  }catch(e){
+    res.status(500).json({ error: 'server_error', message: e.message });
+  }
+});{
+  "name": "parts-cam-backend",
+  "version": "1.0.0",
+  "description": "Token server for Parts Cam - keeps Google Drive sign-in permanent",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
+
+
+app.get('/', (req, res) => res.send('Parts Cam token server is running.'));
+
+app.listen(PORT, () => console.log('Listening on ' + PORT));
