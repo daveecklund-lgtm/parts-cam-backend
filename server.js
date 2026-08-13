@@ -17,15 +17,24 @@ const {
   GOOGLE_CLIENT_SECRET,
   REDIRECT_URI,       // e.g. https://your-app.onrender.com/auth/callback
   APP_SHARED_SECRET,  // a random string only your app knows, to protect /token
-  ALLOWED_ORIGIN       // e.g. https://daveecklund-lgtm.github.io
+  ALLOWED_ORIGIN,     // e.g. https://daveecklund-lgtm.github.io
+  GOOGLE_REFRESH_TOKEN // set this once (see /auth/start output) so it survives restarts
 } = process.env;
 
 const TOKEN_FILE = path.join(__dirname, 'refresh_token.json');
 
 function saveRefreshToken(token){
-  fs.writeFileSync(TOKEN_FILE, JSON.stringify({ refresh_token: token }));
+  // Best-effort local cache. On hosts with ephemeral disks (Render free tier) this
+  // is wiped on restart — which is why GOOGLE_REFRESH_TOKEN env var is preferred.
+  try{
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify({ refresh_token: token }));
+  }catch(e){
+    console.log('Could not write token file (ephemeral disk?):', e.message);
+  }
 }
 function loadRefreshToken(){
+  // Env var wins — it persists across restarts and redeploys.
+  if(GOOGLE_REFRESH_TOKEN) return GOOGLE_REFRESH_TOKEN;
   try{
     return JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8')).refresh_token;
   }catch(e){
@@ -79,7 +88,21 @@ app.get('/auth/callback', async (req, res) => {
       );
     }
     saveRefreshToken(data.refresh_token);
-    res.send('Connected! Your Parts Cam app can now stay signed in permanently. You can close this tab.');
+    res.send(
+      '<html><body style="font-family:system-ui;max-width:640px;margin:40px auto;line-height:1.6">' +
+      '<h2>Connected to Google Drive</h2>' +
+      '<p><b>One more step to make this permanent.</b> This host wipes local files on restart, ' +
+      'so save the token below as an environment variable and it will survive forever:</p>' +
+      '<ol><li>In Render: your service &rarr; Environment &rarr; Add Environment Variable</li>' +
+      '<li>Key: <code>GOOGLE_REFRESH_TOKEN</code></li>' +
+      '<li>Value: copy the string below</li>' +
+      '<li>Save (Render redeploys automatically)</li></ol>' +
+      '<p style="word-break:break-all;background:#f2f2f2;padding:12px;border-radius:6px;font-family:monospace">' +
+      data.refresh_token + '</p>' +
+      '<p style="color:#a00"><b>Treat this like a password</b> &mdash; it grants access to your Drive. ' +
+      'Do not share or post it. Close this tab once saved.</p>' +
+      '</body></html>'
+    );
   }catch(e){
     res.status(500).send('Error exchanging code: ' + e.message);
   }
