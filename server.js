@@ -15,7 +15,9 @@ const {
   REDIRECT_URI,       // e.g. https://your-app.onrender.com/auth/callback
   APP_SHARED_SECRET,  // a random string only your app knows, to protect /token
   ALLOWED_ORIGIN,     // e.g. https://daveecklund-lgtm.github.io
-  GOOGLE_REFRESH_TOKEN // set this once (see /auth/start output) so it survives restarts
+  GOOGLE_REFRESH_TOKEN, // set this once (see /auth/start output) so it survives restarts
+  ANTHROPIC_API_KEY,  // for /ocr -- NEVER put this in the phone page, that file is public
+  OCR_MODEL           // optional override, defaults below
 } = process.env;
 
 const TOKEN_FILE = path.join(__dirname, 'refresh_token.json');
@@ -38,6 +40,10 @@ function loadRefreshToken(){
     return null;
   }
 }
+
+// /ocr posts a base64 JPEG, so a JSON body parser is needed. Limit is generous
+// enough for a ~1600px photo (base64 adds about a third).
+app.use(express.json({ limit: '12mb' }));
 
 // CORS: only allow your GitHub Pages app to call this server
 app.use((req, res, next) => {
@@ -130,6 +136,79 @@ app.get('/token', async (req, res) => {
       return res.status(500).json({ error: 'refresh_failed', detail: data });
     }
     res.json({ access_token: data.access_token, expires_in: data.expires_in });
+  }catch(e){
+    res.status(500).json({ error: 'server_error', message: e.message });
+  }
+});
+
+// Read a part number off a photo with Claude vision.
+// Body: { image: "data:image/jpeg;base64,..." }
+// Returns: { candidates: [{ text, alternates: [..], confidence }] }
+const OCR_PROMPT = [
+  'This is a photo of an automotive part label, tag, or a number stamped into a part.',
+  'Transcribe every distinct part number you can see.',
+  '',
+  'Rules:',
+  '- Transcribe EXACTLY as printed, including dashes. Do not normalise, expand or tidy.',
+  '- These are OEM part numbers (Ford, Caterpillar and similar). They mix letters and',
+  '  digits freely, so you cannot infer a character from its neighbours.',
+  '- Some characters are genuinely ambiguous in these fonts: 0/O, 1/I/L, 5/S, 8/B, 2/Z,',
+  '  6/G, 7/T, 4/A. When you are not certain which one is printed, put your best reading',
+  '  in "text" and add the OTHER full readings to "alternates". Include one alternate per',
+  '  plausible combination, up to 8. This matters more than picking correctly.',
+  '- Ignore dates, quantities, barcodes, prices, phone numbers and marketing text.',
+  '- If you cannot read any part number, return an empty candidates array.',
+  '',
+  'Reply with JSON only, no other text:',
+  '{"candidates":[{"text":"F67Z-7A095-BA","alternates":["F672-7A095-BA"],"confidence":"high"}]}'
+].join('\n');
+
+app.post('/ocr', async (req, res) => {
+  if(req.headers['x-app-secret'] !== APP_SHARED_SECRET){
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  if(!ANTHROPIC_API_KEY){
+    return res.status(400).json({ error: 'not_configured',
+      message: 'Set ANTHROPIC_API_KEY in the Render environment to enable Claude OCR.' });
+  }
+  const image = (req.body && req.body.image) || '';
+  const m = /^data:image\/(jpeg|jpg|png|webp);base64,(.+)$/i.exec(image);
+  if(!m) return res.status(400).json({ error: 'bad_image', message: 'Expected a base64 data URL.' });
+  const mediaType = 'image/' + (m[1].toLowerCase() === 'jpg' ? 'jpeg' : m[1].toLowerCase());
+
+  try{
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: OCR_MODEL || 'claude-haiku-4-5',   // fast + cheap for a phone tag read (Dave's pick); override via OCR_MODEL
+        max_tokens: 1024,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: mediaType, data: m[2] } },
+            { type: 'text', text: OCR_PROMPT }
+          ]
+        }]
+      })
+    });
+    const data = await r.json();
+    if(!r.ok){
+      const detail = (data && data.error && data.error.message) || ('HTTP ' + r.status);
+      return res.status(502).json({ error: 'ocr_failed', message: detail });
+    }
+    const text = (data.content || []).filter(c => c.type === 'text').map(c => c.text).join('');
+    // The model is told to reply with JSON only; pull the object out defensively anyway.
+    const j = /\{[\s\S]*\}/.exec(text);
+    if(!j) return res.json({ candidates: [], raw: text });
+    let parsed;
+    try{ parsed = JSON.parse(j[0]); }
+    catch(e){ return res.json({ candidates: [], raw: text }); }
+    res.json({ candidates: Array.isArray(parsed.candidates) ? parsed.candidates : [] });
   }catch(e){
     res.status(500).json({ error: 'server_error', message: e.message });
   }
